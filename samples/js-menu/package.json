@@ -20,7 +20,7 @@
     "@genkit-ai/evaluator": "^1.0.4",
     "@genkit-ai/firebase": "^1.0.4",
     "@genkit-ai/vertexai": "^1.0.4",
-    "genkit": "^1.0.4"
+    "genkit": "^1.19.3"
   },
   "devDependencies": {
     "genkit-cli": "^1.0.4",
