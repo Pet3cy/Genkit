@@ -16,7 +16,7 @@
   "dependencies": {
     "genkit": "^1.0.4",
     "@genkit-ai/google-genai": "^1.17.0",
-    "@genkit-ai/express": "^1.17.0",
+    "@genkit-ai/express": "^1.19.3",
     "express": "^4.21.0",
     "partial-json": "^0.1.7"
   },
