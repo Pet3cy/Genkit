@@ -1,0 +1,526 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# ══════════════════════════════════════════════════════════════════════
+# ReleaseKit: Java/Kotlin Release Pipeline (Gradle)
+# ══════════════════════════════════════════════════════════════════════
+#
+# SAMPLE WORKFLOW — Copy to .github/workflows/releasekit-gradle.yml to use.
+#
+# This workflow implements a release pipeline for Java/Kotlin projects
+# managed by Gradle (settings.gradle / settings.gradle.kts). It uses
+# releasekit to automate:
+#
+#   1. PREPARE  — compute version bumps, generate changelogs, open
+#                 or update a Release PR.
+#   2. RELEASE  — tag the merge commit, create a GitHub Release.
+#   3. PUBLISH  — publish artifacts to Maven Central (via Sonatype
+#                 OSSRH) in topological order with retry and
+#                 verification.
+#
+# ── Automatic Flow ──────────────────────────────────────────────────
+#
+#   push to main ──► releasekit prepare ──► Release PR
+#   (java/** or jvm/**)                        (autorelease: pending)
+#                                                  │
+#                                             merge PR
+#                                                  │
+#                                                  ▼
+#                                        releasekit release ──► tags + GitHub Release
+#                                                  │
+#                                                  ▼
+#                                        releasekit publish ──► Maven Central
+#                                                  │
+#                                                  ▼
+#                                        repository_dispatch ──► downstream repos
+#
+# ── Manual Dispatch Flow ────────────────────────────────────────────
+#
+#   ┌─────────────────────────────────────────────────────────────┐
+#   │  workflow_dispatch UI                                       │
+#   │                                                             │
+#   │  action:  [prepare ▼]  ──► runs PREPARE job only            │
+#   │           [release ▼]  ──► runs RELEASE + PUBLISH + NOTIFY  │
+#   │                                                             │
+#   │  target:         [maven-central / staging]                  │
+#   │  dry_run:        [✓] simulate, no side effects              │
+#   │  force_prepare:  [✓] skip preflight, force PR creation      │
+#   │  group:          [________] target a release group           │
+#   │  bump_type:      [auto / patch / minor / major]             │
+#   │  prerelease:     [________] e.g. rc.1, beta.1               │
+#   │  skip_publish:   [✓] tag + release but don't publish        │
+#   │  concurrency:    [0] max parallel publish (0 = auto)        │
+#   │  max_retries:    [2] retry failed publishes                 │
+#   └─────────────────────────────────────────────────────────────┘
+#
+# ── Trigger Matrix ──────────────────────────────────────────────────
+#
+#   Event              │ Jobs that run
+#   ───────────────────┼──────────────────────────────────
+#   push to main       │ prepare
+#   PR merged          │ release → publish → notify
+#   dispatch: prepare  │ prepare
+#   dispatch: release  │ release → publish → notify
+#
+# ── Inputs Reference ────────────────────────────────────────────────
+#
+#   Input          │ Type    │ Default        │ Description
+#   ───────────────┼─────────┼────────────────┼──────────────────────
+#   action         │ choice  │ release        │ Pipeline stage
+#   target         │ choice  │ maven-central  │ Registry target
+#   dry_run        │ boolean │ true           │ Simulate
+#   force_prepare  │ boolean │ false          │ Force PR creation
+#   group          │ string  │ (all)          │ Release group
+#   bump_type      │ choice  │ auto           │ Override bump
+#   prerelease     │ string  │ (none)         │ Prerelease suffix
+#   skip_publish   │ boolean │ false          │ Skip registry
+#   concurrency    │ string  │ 0              │ Max parallel
+#   max_retries    │ string  │ 2              │ Retry count
+#   no_ai          │ boolean │ false          │ Disable AI features
+#   model          │ string  │ (chain)        │ Override AI model
+#   codename_theme │ string  │ (cfg)          │ Override codename theme
+#
+# ── Authentication ──────────────────────────────────────────────────
+#
+# Publishing to Maven Central via Sonatype OSSRH requires:
+#
+#   OSSRH_USERNAME      — Sonatype OSSRH username
+#   OSSRH_PASSWORD      — Sonatype OSSRH password/token
+#   GPG_SIGNING_KEY     — GPG private key (base64-encoded)
+#   GPG_PASSPHRASE      — GPG key passphrase
+#
+# These should be stored as GitHub repository secrets.
+#
+# The workflow is idempotent: re-running any step is safe because
+# releasekit skips already-created tags and already-published versions.
+# ══════════════════════════════════════════════════════════════════════
+
+name: "ReleaseKit: Java (Gradle)"
+
+on:
+  workflow_call:
+    inputs:
+      action:
+        description: 'Which pipeline stage to run'
+        required: false
+        default: release
+        type: string
+      target:
+        description: 'Publish target registry'
+        required: false
+        default: maven-central
+        type: string
+      dry_run:
+        description: 'Dry run'
+        required: false
+        default: true
+        type: boolean
+      force_prepare:
+        description: 'Force PR creation'
+        required: false
+        default: false
+        type: boolean
+      group:
+        description: 'Release group'
+        required: false
+        type: string
+      bump_type:
+        description: 'Override bump type'
+        required: false
+        default: auto
+        type: string
+      prerelease:
+        description: 'Prerelease suffix'
+        required: false
+        type: string
+      skip_publish:
+        description: 'Skip publishing to Maven Central'
+        required: false
+        default: false
+        type: boolean
+      concurrency:
+        description: 'Max parallel publish jobs'
+        required: false
+        default: '0'
+        type: string
+      max_retries:
+        description: 'Max retries'
+        required: false
+        default: '2'
+        type: string
+      no_ai:
+        description: 'Disable all AI features'
+        required: false
+        default: false
+        type: boolean
+      model:
+        description: 'Override AI model'
+        required: false
+        default: ''
+        type: string
+      codename_theme:
+        description: 'Override codename theme'
+        required: false
+        default: ''
+        type: string
+    secrets:
+      GITHUB_TOKEN:
+        required: false
+      OSSRH_USERNAME:
+        required: false
+      OSSRH_PASSWORD:
+        required: false
+      GPG_SIGNING_KEY:
+        required: false
+      GPG_PASSPHRASE:
+        required: false
+      GEMINI_API_KEY:
+        required: false
+      RELEASEKIT_APP_PRIVATE_KEY:
+        description: 'GitHub App private key for CLA-passing commits'
+        required: false
+      RELEASEKIT_TOKEN:
+        description: 'Personal Access Token fallback'
+        required: false
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Which pipeline stage to run'
+        required: true
+        default: release
+        type: choice
+        options:
+          - prepare
+          - release
+      target:
+        description: 'Publish target registry (release only)'
+        required: true
+        default: maven-central
+        type: choice
+        options:
+          - maven-central
+          - staging
+      dry_run:
+        description: 'Dry run — log what would happen without creating tags or publishing'
+        required: true
+        default: true
+        type: boolean
+      force_prepare:
+        description: 'Force create/update the Release PR even if no new bumps are detected'
+        required: false
+        default: false
+        type: boolean
+      group:
+        description: 'Release group to target (leave empty for all)'
+        required: false
+        type: string
+      bump_type:
+        description: 'Override auto-detected bump type'
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - patch
+          - minor
+          - major
+      prerelease:
+        description: 'Publish as prerelease (e.g. rc.1, beta.1)'
+        required: false
+        type: string
+      skip_publish:
+        description: 'Tag and create GitHub Release but skip publishing to Maven Central'
+        required: false
+        default: false
+        type: boolean
+      concurrency:
+        description: 'Max parallel publish jobs (0 = auto)'
+        required: false
+        default: '0'
+        type: string
+      max_retries:
+        description: 'Max retries for failed publish attempts (0 = no retries)'
+        required: false
+        default: '2'
+        type: string
+      no_ai:
+        description: 'Disable all AI features (summarization, codenames)'
+        required: false
+        default: false
+        type: boolean
+      model:
+        description: 'Override AI model (e.g. ollama/gemma3:12b)'
+        required: false
+        type: string
+      codename_theme:
+        description: 'Override codename theme (e.g. galaxies, animals)'
+        required: false
+        type: string
+      auth_method:
+        description: 'Authentication method (auto = detect from configured secrets)'
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - app
+          - pat
+          - github-token
+  push:
+    branches: [main]
+    paths:
+      - "java/**"
+      - "jvm/**"
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+# Only one release pipeline runs at a time.
+concurrency:
+  group: releasekit-java-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  RELEASEKIT_DIR: py/tools/releasekit
+  WORKSPACE_DIR: java
+  JAVA_VERSION: "17"
+  GRADLE_VERSION: "8.7"
+  DRY_RUN: ${{ github.event_name == 'pull_request' && 'false' || (inputs.dry_run == 'false' && 'false' || 'true') }}
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════
+  # AUTH: Resolve token (GitHub App → PAT → GITHUB_TOKEN)
+  # ═══════════════════════════════════════════════════════════════════════
+  auth:
+    name: Resolve Auth Token
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      token: ${{ steps.resolve.outputs.token }}
+      git-user-name: ${{ steps.resolve.outputs.git-user-name }}
+      git-user-email: ${{ steps.resolve.outputs.git-user-email }}
+    steps:
+      - name: Generate GitHub App token
+        if: >
+          (inputs.auth_method == 'auto' || inputs.auth_method == 'app' || inputs.auth_method == '')
+          && vars.RELEASEKIT_APP_ID != ''
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.RELEASEKIT_APP_ID }}
+          private-key: ${{ secrets.RELEASEKIT_APP_PRIVATE_KEY }}
+
+      - name: Get App bot user ID
+        if: steps.app-token.outcome == 'success'
+        id: app-user
+        run: |
+          if ! user_id=$(gh api "/users/${{ steps.app-token.outputs.app-slug }}[bot]" --jq .id 2>/dev/null); then
+            echo "::warning::Failed to fetch App bot user ID — using 0 as fallback"
+            user_id=0
+          fi
+          echo "user-id=$user_id" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Resolve token and identity
+        id: resolve
+        run: |
+          AUTH="${{ inputs.auth_method || 'auto' }}"
+          if [ "$AUTH" = "app" ] || { [ "$AUTH" = "auto" ] && [ -n "$APP_TOKEN" ]; }; then
+            echo "token=$APP_TOKEN" >> "$GITHUB_OUTPUT"
+            echo "git-user-name=${{ steps.app-token.outputs.app-slug }}[bot]" >> "$GITHUB_OUTPUT"
+            echo "git-user-email=${{ steps.app-user.outputs.user-id }}+${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com" >> "$GITHUB_OUTPUT"
+          elif [ "$AUTH" = "pat" ] || { [ "$AUTH" = "auto" ] && [ -n "$PAT_TOKEN" ]; }; then
+            echo "token=$PAT_TOKEN" >> "$GITHUB_OUTPUT"
+            echo "git-user-name=${GIT_USER_NAME:-releasekit[bot]}" >> "$GITHUB_OUTPUT"
+            echo "git-user-email=${GIT_USER_EMAIL:-releasekit[bot]@users.noreply.github.com}" >> "$GITHUB_OUTPUT"
+          else
+            echo "token=$FALLBACK_TOKEN" >> "$GITHUB_OUTPUT"
+            echo "git-user-name=${GIT_USER_NAME:-github-actions[bot]}" >> "$GITHUB_OUTPUT"
+            echo "git-user-email=${GIT_USER_EMAIL:-github-actions[bot]@users.noreply.github.com}" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          PAT_TOKEN: ${{ secrets.RELEASEKIT_TOKEN }}
+          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIT_USER_NAME: ${{ vars.RELEASEKIT_GIT_USER_NAME }}
+          GIT_USER_EMAIL: ${{ vars.RELEASEKIT_GIT_USER_EMAIL }}
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # PREPARE: Compute bumps and open/update Release PR
+  # ═══════════════════════════════════════════════════════════════════════
+  prepare:
+    name: Prepare Release PR
+    needs: auth
+    if: |
+      (github.event_name == 'push' &&
+       !startsWith(github.event.head_commit.message, 'chore(release):') &&
+       !contains(github.event.head_commit.message, 'releasekit--release')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.action == 'prepare')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      has_bumps: ${{ steps.rk.outputs.has-bumps }}
+      pr_url: ${{ steps.rk.outputs.pr-url }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ needs.auth.outputs.token }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Run releasekit prepare
+        id: rk
+        uses: ./py/tools/releasekit
+        with:
+          command: prepare
+          workspace: java
+          force: ${{ inputs.force_prepare && 'true' || 'false' }}
+          group: ${{ inputs.group }}
+          bump-type: ${{ inputs.bump_type }}
+          prerelease: ${{ inputs.prerelease }}
+          no-ai: ${{ inputs.no_ai && 'true' || 'false' }}
+          model: ${{ inputs.model }}
+          codename-theme: ${{ inputs.codename_theme }}
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # RELEASE: Tag merge commit and create GitHub Release
+  # ═══════════════════════════════════════════════════════════════════════
+  release:
+    name: Tag and Release
+    needs: auth
+    if: |
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.merged == true &&
+       contains(github.event.pull_request.labels.*.name, 'autorelease: pending')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.action == 'release')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      release_url: ${{ steps.rk.outputs.release-url }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ needs.auth.outputs.token }}
+
+      - name: Run releasekit release
+        id: rk
+        uses: ./py/tools/releasekit
+        with:
+          command: release
+          workspace: java
+          dry-run: ${{ env.DRY_RUN }}
+          no-ai: ${{ inputs.no_ai && 'true' || 'false' }}
+          model: ${{ inputs.model }}
+          codename-theme: ${{ inputs.codename_theme }}
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # PUBLISH: Build and publish artifacts to Maven Central
+  # ═══════════════════════════════════════════════════════════════════════
+  publish:
+    name: Publish to ${{ inputs.target || 'maven-central' }}
+    needs: [auth, release]
+    if: inputs.skip_publish != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Import GPG signing key
+        run: |
+          echo "${{ secrets.GPG_SIGNING_KEY }}" | base64 -d | gpg --batch --import
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: Build Java artifacts
+        working-directory: ${{ env.WORKSPACE_DIR }}
+        run: gradle build --no-daemon
+
+      - name: Run releasekit publish
+        id: rk
+        uses: ./py/tools/releasekit
+        with:
+          command: publish
+          workspace: java
+          dry-run: ${{ env.DRY_RUN }}
+          force: "true"
+          group: ${{ inputs.group }}
+          concurrency: ${{ inputs.concurrency || '0' }}
+          max-retries: ${{ inputs.max_retries || '2' }}
+          no-ai: ${{ inputs.no_ai && 'true' || 'false' }}
+          model: ${{ inputs.model }}
+          codename-theme: ${{ inputs.codename_theme }}
+        env:
+          OSSRH_USERNAME: ${{ secrets.OSSRH_USERNAME }}
+          OSSRH_PASSWORD: ${{ secrets.OSSRH_PASSWORD }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+      - name: Upload manifest artifact
+        if: success() && env.DRY_RUN != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest-java
+          path: ${{ env.WORKSPACE_DIR }}/.releasekit-state.json
+          retention-days: 90
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # NOTIFY: Post-release notifications
+  # ═══════════════════════════════════════════════════════════════════════
+  notify:
+    name: Notify Downstream
+    needs: [auth, release, publish]
+    if: success()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch release event
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ needs.auth.outputs.token }}
+          event-type: genkit-java-release
+          client-payload: '{"release_url": "${{ needs.release.outputs.release_url }}"}'

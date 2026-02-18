@@ -15,6 +15,7 @@
  */
 
 import {
+  cancelOperation,
   checkOperation,
   defineHelper,
   definePartial,
@@ -25,6 +26,7 @@ import {
   generate,
   generateStream,
   loadPromptFolder,
+  modelRef,
   prompt,
   rerank,
   retrieve,
@@ -46,6 +48,7 @@ import {
   type GenerationCommonConfigSchema,
   type IndexerParams,
   type ModelArgument,
+  type ModelReference,
   type Part,
   type PromptConfig,
   type PromptGenerateOptions,
@@ -97,7 +100,12 @@ import {
   type RetrieverFn,
   type SimpleRetrieverOptions,
 } from '@genkit-ai/ai/retriever';
-import { dynamicTool, type ToolFn } from '@genkit-ai/ai/tool';
+import {
+  dynamicTool,
+  type MultipartToolAction,
+  type MultipartToolFn,
+  type ToolFn,
+} from '@genkit-ai/ai/tool';
 import {
   ActionFnArg,
   GenkitError,
@@ -223,6 +231,16 @@ export class Genkit implements HasRegistry {
   }
 
   /**
+   * Defines and registers a tool that can return multiple parts of content.
+   *
+   * Tools can be passed to models by name or value during `generate` calls to be called automatically based on the prompt and situation.
+   */
+  defineTool<I extends z.ZodTypeAny, O extends z.ZodTypeAny>(
+    config: { multipart: true } & ToolConfig<I, O>,
+    fn: MultipartToolFn<I, O>
+  ): MultipartToolAction<I, O>;
+
+  /**
    * Defines and registers a tool.
    *
    * Tools can be passed to models by name or value during `generate` calls to be called automatically based on the prompt and situation.
@@ -230,8 +248,13 @@ export class Genkit implements HasRegistry {
   defineTool<I extends z.ZodTypeAny, O extends z.ZodTypeAny>(
     config: ToolConfig<I, O>,
     fn: ToolFn<I, O>
-  ): ToolAction<I, O> {
-    return defineTool(this.registry, config, fn);
+  ): ToolAction<I, O>;
+
+  defineTool<I extends z.ZodTypeAny, O extends z.ZodTypeAny>(
+    config: ({ multipart?: true } & ToolConfig<I, O>) | string,
+    fn: ToolFn<I, O> | MultipartToolFn<I, O>
+  ): ToolAction<I, O> | MultipartToolAction<I, O> {
+    return defineTool(this.registry, config as any, fn as any);
   }
 
   /**
@@ -658,7 +681,7 @@ export class Genkit implements HasRegistry {
    * ```ts
    * const ai = genkit({
    *   plugins: [googleAI()],
-   *   model: gemini15Flash, // default model
+   *   model: googleAI.model('gemini-2.5-flash'), // default model
    * })
    *
    * const { text } = await ai.generate('hi');
@@ -674,7 +697,7 @@ export class Genkit implements HasRegistry {
    * ```ts
    * const ai = genkit({
    *   plugins: [googleAI()],
-   *   model: gemini15Flash, // default model
+   *   model: googleAI.model('gemini-2.5-flash'), // default model
    * })
    *
    * const { text } = await ai.generate([
@@ -708,7 +731,7 @@ export class Genkit implements HasRegistry {
    *   ],
    *   messages: conversationHistory,
    *   tools: [ userInfoLookup ],
-   *   model: gemini15Flash,
+   *   model: googleAI.model('gemini-2.5-flash'),
    * });
    * ```
    */
@@ -750,7 +773,7 @@ export class Genkit implements HasRegistry {
    * ```ts
    * const ai = genkit({
    *   plugins: [googleAI()],
-   *   model: gemini15Flash, // default model
+   *   model: googleAI.model('gemini-2.5-flash'), // default model
    * })
    *
    * const { response, stream } = ai.generateStream('hi');
@@ -770,7 +793,7 @@ export class Genkit implements HasRegistry {
    * ```ts
    * const ai = genkit({
    *   plugins: [googleAI()],
-   *   model: gemini15Flash, // default model
+   *   model: googleAI.model('gemini-2.5-flash'), // default model
    * })
    *
    * const { response, stream } = ai.generateStream([
@@ -808,7 +831,7 @@ export class Genkit implements HasRegistry {
    *   ],
    *   messages: conversationHistory,
    *   tools: [ userInfoLookup ],
-   *   model: gemini15Flash,
+   *   model: googleAI.model('gemini-2.5-flash'),
    * });
    * for await (const chunk of stream) {
    *   console.log(chunk.text);
@@ -861,6 +884,16 @@ export class Genkit implements HasRegistry {
    */
   checkOperation<T>(operation: Operation<T>): Promise<Operation<T>> {
     return checkOperation(this.registry, operation);
+  }
+
+  /**
+   * Cancels a given operation. Returns a new operation which will contain the updated status.
+   *
+   * @param operation
+   * @returns
+   */
+  cancelOperation<T>(operation: Operation<T>): Promise<Operation<T>> {
+    return cancelOperation(this.registry, operation);
   }
 
   /**
@@ -933,7 +966,7 @@ export class Genkit implements HasRegistry {
       this.registry.registerValue(
         'defaultModel',
         'defaultModel',
-        this.options.model
+        toModelRef(this.options.model)
       );
     }
     if (this.options.promptDir !== null) {
@@ -1053,7 +1086,7 @@ export function genkit(options: GenkitOptions): Genkit {
 }
 
 const shutdown = async () => {
-  logger.info('Shutting down all Genkit servers...');
+  logger.debug('Shutting down all Genkit servers...');
   await ReflectionServer.stopAll();
   process.exit(0);
 };
@@ -1065,4 +1098,23 @@ let disableReflectionApi = false;
 
 export function __disableReflectionApi() {
   disableReflectionApi = true;
+}
+
+/** Helper method to map ModelArgument to ModelReference */
+function toModelRef(
+  modelArg: ModelArgument<any> | undefined
+): ModelReference<any> | undefined {
+  if (modelArg === undefined) {
+    return undefined;
+  }
+  if (typeof modelArg === 'string') {
+    return modelRef({ name: modelArg });
+  }
+  if ((modelArg as ModelReference<any>).name) {
+    return modelArg as ModelReference<any>;
+  }
+  const modelAction = modelArg as ModelAction;
+  return modelRef({
+    name: modelAction.__action.name,
+  });
 }

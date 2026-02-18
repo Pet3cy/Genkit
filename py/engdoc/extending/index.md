@@ -43,13 +43,28 @@ genkit: {
   }
   plugins: {
     style: {fill: "#FCE4EC"}
-    chroma
-    pinecone
     google_genai
     google_cloud
-    openai
+    vertex_ai
     firebase
     ollama
+    anthropic
+    amazon_bedrock
+    cloudflare_workers_ai
+    cohere
+    compat_oai
+    deepseek
+    huggingface
+    microsoft_foundry
+    mistral
+    xai
+    observability
+    checks
+    evaluators
+    mcp
+    fastapi
+    flask
+    dev_local_vectorstore
   }
 }
 
@@ -119,7 +134,7 @@ text templates (e.g. using a templating language such as Handlebars):
 
 ```dotprompt
 ---
-model: vertexai/gemini-1.5-flash
+model: vertexai/gemini-2.5-flash
 config:
   temperature: 0.9
 input:

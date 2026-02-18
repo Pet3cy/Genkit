@@ -23,6 +23,8 @@ import {
 } from '@genkit-ai/tools-common/utils';
 import { Command, program } from 'commander';
 import { config } from './commands/config';
+import { devTestModel } from './commands/dev-test-model';
+import { docsList, docsRead, docsSearch } from './commands/docs';
 import { evalExtractData } from './commands/eval-extract-data';
 import { evalFlow } from './commands/eval-flow';
 import { evalRun } from './commands/eval-run';
@@ -59,7 +61,11 @@ const commands: Command[] = [
   initAiTools,
   config,
   start,
+  devTestModel,
   mcp,
+  docsList,
+  docsRead,
+  docsSearch,
 ];
 
 /** Main entry point for CLI. */

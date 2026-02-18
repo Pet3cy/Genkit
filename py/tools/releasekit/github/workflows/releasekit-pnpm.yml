@@ -1,0 +1,554 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# ══════════════════════════════════════════════════════════════════════
+# ReleaseKit: JS Release Pipeline (pnpm)
+# ══════════════════════════════════════════════════════════════════════
+#
+# NOT YET ACTIVE — This workflow lives in py/tools/releasekit/github/
+# workflows/ and must be copied to .github/workflows/ to activate.
+#
+# Prerequisites before enabling:
+#   1. Uncomment [workspace.js] and [workspace.js-cli] in releasekit.toml
+#   2. Set bootstrap_sha to the last commit before releasekit adoption
+#   3. Run 1–2 dry-run cycles alongside existing scripts
+#   4. Copy this file to .github/workflows/releasekit-pnpm.yml
+#   5. Archive scripts/release_main.sh and js/scripts/bump_*.sh
+#
+# This workflow manages TWO workspaces:
+#   - js      — core SDK + plugins (js/**)
+#   - js-cli  — CLI tools (genkit-tools/**)
+#
+# ── Automatic Flow ──────────────────────────────────────────────────
+#
+#   push to main ──► releasekit prepare --workspace js     ──► Release PR (js)
+#   (js/** or          releasekit prepare --workspace js-cli ──► Release PR (js-cli)
+#    typescript/**)                                              │
+#                                                           merge PR
+#                                                                │
+#                                                                ▼
+#                                                      releasekit release ──► tags + GitHub Release
+#                                                                │
+#                                                                ▼
+#                                                      releasekit publish ──► npm (via Wombat)
+#                                                                │
+#                                                                ▼
+#                                                      repository_dispatch ──► downstream repos
+#
+# ── Manual Dispatch Flow ────────────────────────────────────────────
+#
+#   ┌─────────────────────────────────────────────────────────────┐
+#   │  workflow_dispatch UI                                       │
+#   │                                                             │
+#   │  action:  [prepare ▼]  ──► runs PREPARE jobs (js + js-cli) │
+#   │           [release ▼]  ──► runs RELEASE + PUBLISH + NOTIFY  │
+#   │                                                             │
+#   │  target:         [npm]                                      │
+#   │  dry_run:        [✓] simulate, no side effects              │
+#   │  force_prepare:  [✓] skip preflight, force PR creation      │
+#   │  group:          [________] target a release group           │
+#   │  bump_type:      [auto / patch / minor / major]             │
+#   │  prerelease:     [________] e.g. rc.1, beta.1               │
+#   │  skip_publish:   [✓] tag + release but don't publish        │
+#   │  concurrency:    [0] max parallel publish (0 = auto)        │
+#   └─────────────────────────────────────────────────────────────┘
+#
+# ── Trigger Matrix ──────────────────────────────────────────────────
+#
+#   Event              │ Jobs that run
+#   ───────────────────┼──────────────────────────────────────────
+#   push to main       │ prepare-js, prepare-js-cli
+#   PR merged          │ release-js → publish-js → notify-js
+#   dispatch: prepare  │ prepare-js, prepare-js-cli
+#   dispatch: release  │ release-js → publish-js → notify-js
+#
+# ── Inputs Reference ────────────────────────────────────────────────
+#
+#   Input          │ Type    │ Default │ Description
+#   ───────────────┼─────────┼─────────┼──────────────────────────────
+#   action         │ choice  │ release │ Pipeline stage: prepare or release
+#   target         │ choice  │ npm     │ Registry: npm
+#   dry_run        │ boolean │ true    │ Simulate without side effects
+#   force_prepare  │ boolean │ false   │ Force PR creation (--force)
+#   group          │ string  │ (all)   │ Target a specific release group
+#   bump_type      │ choice  │ auto    │ Override semver bump detection
+#   prerelease     │ string  │ (none)  │ Prerelease suffix (e.g. rc.1)
+#   skip_publish   │ boolean │ false   │ Tag + release, skip registry
+#   concurrency    │ string  │ 0       │ Max parallel publish jobs
+#   max_retries    │ string  │ 2       │ Retry failed publishes (0 = off)
+#   no_ai          │ boolean │ false   │ Disable AI features
+#   model          │ string  │ (chain) │ Override AI model
+#   codename_theme │ string  │ (cfg)   │ Override codename theme
+#
+# The workflow is idempotent: re-running any step is safe because
+# releasekit skips already-created tags and already-published versions.
+# ══════════════════════════════════════════════════════════════════════
+
+name: "ReleaseKit: JS (pnpm)"
+
+on:
+  workflow_call:
+    inputs:
+      action:
+        description: 'Which pipeline stage to run'
+        required: false
+        default: release
+        type: string
+      target:
+        description: 'Publish target registry (release only)'
+        required: false
+        default: npm
+        type: string
+      dry_run:
+        description: 'Dry run — log what would happen without creating tags or publishing'
+        required: false
+        default: true
+        type: boolean
+      force_prepare:
+        description: 'Force create/update the Release PR even if no new bumps are detected'
+        required: false
+        default: false
+        type: boolean
+      group:
+        description: 'Release group to target (leave empty for all)'
+        required: false
+        type: string
+      bump_type:
+        description: 'Override auto-detected bump type'
+        required: false
+        default: auto
+        type: string
+      prerelease:
+        description: 'Publish as prerelease (e.g. rc.1, beta.1)'
+        required: false
+        type: string
+      skip_publish:
+        description: 'Tag and create GitHub Release but skip publishing to registry'
+        required: false
+        default: false
+        type: boolean
+      concurrency:
+        description: 'Max parallel publish jobs (0 = auto)'
+        required: false
+        default: '0'
+        type: string
+      max_retries:
+        description: 'Max retries for failed publish attempts (0 = no retries)'
+        required: false
+        default: '2'
+        type: string
+      no_ai:
+        description: 'Disable all AI features (summarization, codenames)'
+        required: false
+        default: false
+        type: boolean
+      model:
+        description: 'Override AI model (e.g. ollama/gemma3:12b)'
+        required: false
+        default: ''
+        type: string
+      codename_theme:
+        description: 'Override codename theme (e.g. galaxies, animals)'
+        required: false
+        default: ''
+        type: string
+    secrets:
+      GITHUB_TOKEN:
+        required: false
+      NPM_TOKEN:
+        required: false
+      GEMINI_API_KEY:
+        required: false
+      RELEASEKIT_APP_PRIVATE_KEY:
+        description: 'GitHub App private key for CLA-passing commits'
+        required: false
+      RELEASEKIT_TOKEN:
+        description: 'Personal Access Token fallback'
+        required: false
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Which pipeline stage to run'
+        required: true
+        default: release
+        type: choice
+        options:
+          - prepare
+          - release
+      target:
+        description: 'Publish target registry (release only)'
+        required: true
+        default: npm
+        type: choice
+        options:
+          - npm
+      dry_run:
+        description: 'Dry run — log what would happen without creating tags or publishing'
+        required: true
+        default: true
+        type: boolean
+      force_prepare:
+        description: 'Force create/update the Release PR even if no new bumps are detected'
+        required: false
+        default: false
+        type: boolean
+      group:
+        description: 'Release group to target (leave empty for all)'
+        required: false
+        type: string
+      bump_type:
+        description: 'Override auto-detected bump type'
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - patch
+          - minor
+          - major
+      prerelease:
+        description: 'Publish as prerelease (e.g. rc.1, beta.1)'
+        required: false
+        type: string
+      skip_publish:
+        description: 'Tag and create GitHub Release but skip publishing to registry'
+        required: false
+        default: false
+        type: boolean
+      concurrency:
+        description: 'Max parallel publish jobs (0 = auto)'
+        required: false
+        default: '0'
+        type: string
+      max_retries:
+        description: 'Max retries for failed publish attempts (0 = no retries)'
+        required: false
+        default: '2'
+        type: string
+      no_ai:
+        description: 'Disable all AI features (summarization, codenames)'
+        required: false
+        default: false
+        type: boolean
+      model:
+        description: 'Override AI model (e.g. ollama/gemma3:12b)'
+        required: false
+        type: string
+      codename_theme:
+        description: 'Override codename theme (e.g. galaxies, animals)'
+        required: false
+        type: string
+      auth_method:
+        description: 'Authentication method (auto = detect from configured secrets)'
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - app
+          - pat
+          - github-token
+  push:
+    branches: [main]
+    paths:
+      - "js/**"
+      - "typescript/**"
+      - "genkit-tools/**"
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+concurrency:
+  group: releasekit-js-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  RELEASEKIT_DIR: py/tools/releasekit
+  NODE_VERSION: "20"
+  # Dry-run logic:
+  #   - PR merge (pull_request closed): dry_run=false (one-button release flow)
+  #   - Manual dispatch: uses the checkbox value (default: true)
+  #   - Push to main: only runs prepare, which is always live
+  DRY_RUN: ${{ github.event_name == 'pull_request' && 'false' || (inputs.dry_run == 'false' && 'false' || 'true') }}
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════
+  # AUTH: Resolve token (GitHub App → PAT → GITHUB_TOKEN)
+  # ═══════════════════════════════════════════════════════════════════════
+  auth:
+    name: Resolve Auth Token
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      token: ${{ steps.resolve.outputs.token }}
+      git-user-name: ${{ steps.resolve.outputs.git-user-name }}
+      git-user-email: ${{ steps.resolve.outputs.git-user-email }}
+    steps:
+      - name: Generate GitHub App token
+        if: >
+          (inputs.auth_method == 'auto' || inputs.auth_method == 'app' || inputs.auth_method == '')
+          && vars.RELEASEKIT_APP_ID != ''
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.RELEASEKIT_APP_ID }}
+          private-key: ${{ secrets.RELEASEKIT_APP_PRIVATE_KEY }}
+
+      - name: Get App bot user ID
+        if: steps.app-token.outcome == 'success'
+        id: app-user
+        run: |
+          if ! user_id=$(gh api "/users/${{ steps.app-token.outputs.app-slug }}[bot]" --jq .id 2>/dev/null); then
+            echo "::warning::Failed to fetch App bot user ID — using 0 as fallback"
+            user_id=0
+          fi
+          echo "user-id=$user_id" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      - name: Resolve token and identity
+        id: resolve
+        run: |
+          AUTH="${{ inputs.auth_method || 'auto' }}"
+          if [ "$AUTH" = "app" ] || { [ "$AUTH" = "auto" ] && [ -n "$APP_TOKEN" ]; }; then
+            echo "token=$APP_TOKEN" >> "$GITHUB_OUTPUT"
+            echo "git-user-name=${{ steps.app-token.outputs.app-slug }}[bot]" >> "$GITHUB_OUTPUT"
+            echo "git-user-email=${{ steps.app-user.outputs.user-id }}+${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com" >> "$GITHUB_OUTPUT"
+          elif [ "$AUTH" = "pat" ] || { [ "$AUTH" = "auto" ] && [ -n "$PAT_TOKEN" ]; }; then
+            echo "token=$PAT_TOKEN" >> "$GITHUB_OUTPUT"
+            echo "git-user-name=${GIT_USER_NAME:-releasekit[bot]}" >> "$GITHUB_OUTPUT"
+            echo "git-user-email=${GIT_USER_EMAIL:-releasekit[bot]@users.noreply.github.com}" >> "$GITHUB_OUTPUT"
+          else
+            echo "token=$FALLBACK_TOKEN" >> "$GITHUB_OUTPUT"
+            echo "git-user-name=${GIT_USER_NAME:-github-actions[bot]}" >> "$GITHUB_OUTPUT"
+            echo "git-user-email=${GIT_USER_EMAIL:-github-actions[bot]@users.noreply.github.com}" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          PAT_TOKEN: ${{ secrets.RELEASEKIT_TOKEN }}
+          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIT_USER_NAME: ${{ vars.RELEASEKIT_GIT_USER_NAME }}
+          GIT_USER_EMAIL: ${{ vars.RELEASEKIT_GIT_USER_EMAIL }}
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # PREPARE: Compute bumps and open/update Release PRs
+  # ═══════════════════════════════════════════════════════════════════════
+  prepare-js:
+    name: "Prepare Release PR (JS)"
+    needs: auth
+    if: |
+      (github.event_name == 'push' &&
+       !startsWith(github.event.head_commit.message, 'chore(release):') &&
+       !contains(github.event.head_commit.message, 'releasekit--release')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.action == 'prepare')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      has_bumps: ${{ steps.rk.outputs.has-bumps }}
+      pr_url: ${{ steps.rk.outputs.pr-url }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ needs.auth.outputs.token }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: js/pnpm-lock.yaml
+
+      - name: Run releasekit prepare
+        id: rk
+        uses: ./py/tools/releasekit
+        with:
+          command: prepare
+          workspace: js
+          force: ${{ inputs.force_prepare && 'true' || 'false' }}
+          group: ${{ inputs.group }}
+          bump-type: ${{ inputs.bump_type }}
+          prerelease: ${{ inputs.prerelease }}
+          no-ai: ${{ inputs.no_ai && 'true' || 'false' }}
+          model: ${{ inputs.model }}
+          codename-theme: ${{ inputs.codename_theme }}
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+  prepare-js-cli:
+    name: "Prepare Release PR (JS CLI)"
+    needs: auth
+    if: |
+      (github.event_name == 'push' &&
+       !startsWith(github.event.head_commit.message, 'chore(release):') &&
+       !contains(github.event.head_commit.message, 'releasekit--release')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.action == 'prepare')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      has_bumps: ${{ steps.rk.outputs.has-bumps }}
+      pr_url: ${{ steps.rk.outputs.pr-url }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ needs.auth.outputs.token }}
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: genkit-tools/pnpm-lock.yaml
+
+      - name: Run releasekit prepare
+        id: rk
+        uses: ./py/tools/releasekit
+        with:
+          command: prepare
+          workspace: js-cli
+          force: ${{ inputs.force_prepare && 'true' || 'false' }}
+          group: ${{ inputs.group }}
+          bump-type: ${{ inputs.bump_type }}
+          prerelease: ${{ inputs.prerelease }}
+          no-ai: ${{ inputs.no_ai && 'true' || 'false' }}
+          model: ${{ inputs.model }}
+          codename-theme: ${{ inputs.codename_theme }}
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # RELEASE: Tag merge commit and create GitHub Release
+  # ═══════════════════════════════════════════════════════════════════════
+  release-js:
+    name: "Tag and Release (JS)"
+    needs: auth
+    if: |
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.merged == true &&
+       contains(github.event.pull_request.labels.*.name, 'autorelease: pending')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.action == 'release')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      release_url: ${{ steps.rk.outputs.release-url }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ needs.auth.outputs.token }}
+
+      - name: Run releasekit release
+        id: rk
+        uses: ./py/tools/releasekit
+        with:
+          command: release
+          workspace: js
+          dry-run: ${{ env.DRY_RUN }}
+          no-ai: ${{ inputs.no_ai && 'true' || 'false' }}
+          model: ${{ inputs.model }}
+          codename-theme: ${{ inputs.codename_theme }}
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # PUBLISH: Build and publish packages to npm
+  # ═══════════════════════════════════════════════════════════════════════
+  publish-js:
+    name: "Publish to npm"
+    needs: [auth, release-js]
+    if: inputs.skip_publish != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: js/pnpm-lock.yaml
+
+      - name: Install JS dependencies
+        working-directory: js
+        run: pnpm install --frozen-lockfile
+
+      - name: Build JS packages
+        working-directory: js
+        run: pnpm build
+
+      - name: Run releasekit publish
+        id: rk
+        uses: ./py/tools/releasekit
+        with:
+          command: publish
+          workspace: js
+          dry-run: ${{ env.DRY_RUN }}
+          force: "true"
+          group: ${{ inputs.group }}
+          concurrency: ${{ inputs.concurrency || '0' }}
+          max-retries: ${{ inputs.max_retries || '2' }}
+          no-ai: ${{ inputs.no_ai && 'true' || 'false' }}
+          model: ${{ inputs.model }}
+          codename-theme: ${{ inputs.codename_theme }}
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+      - name: Upload manifest artifact
+        if: success() && env.DRY_RUN != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest-js
+          path: .releasekit-state.json
+          retention-days: 90
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # NOTIFY: Post-release notifications
+  # ═══════════════════════════════════════════════════════════════════════
+  notify-js:
+    name: "Notify Downstream (JS)"
+    needs: [auth, release-js, publish-js]
+    if: success() && needs.publish-js.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch release event
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ needs.auth.outputs.token }}
+          event-type: genkit-js-release
+          client-payload: '{"release_url": "${{ needs.release-js.outputs.release_url }}"}'

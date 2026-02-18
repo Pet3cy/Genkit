@@ -29,6 +29,9 @@ import { embedderRef } from 'genkit/embedder';
 import { getApiKeyFromEnvVar } from './common.js';
 import type { PluginOptions } from './index.js';
 
+/**
+ * @deprecated
+ */
 export const TaskTypeSchema = z.enum([
   'RETRIEVAL_DOCUMENT',
   'RETRIEVAL_QUERY',
@@ -36,8 +39,14 @@ export const TaskTypeSchema = z.enum([
   'CLASSIFICATION',
   'CLUSTERING',
 ]);
+/**
+ * @deprecated
+ */
 export type TaskType = z.infer<typeof TaskTypeSchema>;
 
+/**
+ * @deprecated
+ */
 export const GeminiEmbeddingConfigSchema = z.object({
   /** Override the API key provided at plugin initialization. */
   apiKey: z.string().optional(),
@@ -51,15 +60,21 @@ export const GeminiEmbeddingConfigSchema = z.object({
   /**
    * The `outputDimensionality` parameter allows you to specify the dimensionality of the embedding output.
    * By default, the model generates embeddings with 768 dimensions. Models such as
-   * `text-embedding-004`, `text-embedding-005`, and `text-multilingual-embedding-002`
+   * `gemini-embedding-001`, `text-embedding-005`, and `text-multilingual-embedding-002`
    * allow the output dimensionality to be adjusted between 1 and 768.
    * By selecting a smaller output dimensionality, users can save memory and storage space, leading to more efficient computations.
    **/
   outputDimensionality: z.number().min(1).max(768).optional(),
 });
 
+/**
+ * @deprecated
+ */
 export type GeminiEmbeddingConfig = z.infer<typeof GeminiEmbeddingConfigSchema>;
 
+/**
+ * @deprecated
+ */
 export const textEmbeddingGecko001 = embedderRef({
   name: 'googleai/embedding-001',
   configSchema: GeminiEmbeddingConfigSchema,
@@ -72,6 +87,9 @@ export const textEmbeddingGecko001 = embedderRef({
   },
 });
 
+/**
+ * @deprecated
+ */
 export const textEmbedding004 = embedderRef({
   name: 'googleai/text-embedding-004',
   configSchema: GeminiEmbeddingConfigSchema,
@@ -84,6 +102,9 @@ export const textEmbedding004 = embedderRef({
   },
 });
 
+/**
+ * @deprecated
+ */
 export const geminiEmbedding001 = embedderRef({
   name: 'googleai/gemini-embedding-001',
   configSchema: GeminiEmbeddingConfigSchema,
@@ -96,12 +117,18 @@ export const geminiEmbedding001 = embedderRef({
   },
 });
 
+/**
+ * @deprecated
+ */
 export const SUPPORTED_MODELS = {
   'embedding-001': textEmbeddingGecko001,
   'text-embedding-004': textEmbedding004,
   'gemini-embedding-001': geminiEmbedding001,
 };
 
+/**
+ * @deprecated
+ */
 export function defineGoogleAIEmbedder(
   ai: Genkit,
   name: string,
